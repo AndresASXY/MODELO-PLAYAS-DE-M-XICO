@@ -1,0 +1,194 @@
+# -*- coding: utf-8 -*-
+import pandas as pd
+import re, time, random
+from datetime import datetime, timedelta
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+def human_delay(min_s=1.5, max_s=4.0):
+    time.sleep(random.uniform(min_s, max_s))
+
+def parse_relative_time_es(t):
+    t = t.lower()
+    # "Hace un/a/1 año"
+    if re.search(r'hace\s+(un|una|1)\s+año', t):
+        return datetime.now() - timedelta(days=365)
+    # "Hace N años"
+    m = re.search(r'hace\s+(\d+)\s+años', t)
+    if m:
+        return datetime.now() - timedelta(days=365 * int(m.group(1)))
+    # meses, semanas, días
+    m = re.search(r'hace\s+(?P<n>\d+|un|una)\s+(?P<u>\w+)', t)
+    if not m:
+        return None
+    n = 1 if m.group('n') in ('un', 'una') else int(m.group('n'))
+    u = m.group('u')
+    if 'día' in u:    return datetime.now() - timedelta(days=n)
+    if 'semana' in u: return datetime.now() - timedelta(weeks=n)
+    if 'mes' in u:    return datetime.now() - timedelta(days=30*n)
+    return None
+
+# Leer links
+df_links = pd.read_csv('/Users/...../ejemplodelarutadetucsv.csv')
+
+# Configurar ChromeDriver en modo stealth
+CHROMEDRIVER_PATH = '/Users/...../chromedriver'  # tu ruta aquí
+service = Service(CHROMEDRIVER_PATH)
+options = webdriver.ChromeOptions()
+options.add_argument('--start-maximized')
+options.add_experimental_option("excludeSwitches", ["enable-automation"])
+options.add_experimental_option("useAutomationExtension", False)
+options.add_argument("--disable-blink-features=AutomationControlled")
+
+driver = webdriver.Chrome(service=service, options=options)
+wait = WebDriverWait(driver, 20)
+# Oculta navigator.webdriver
+driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+    "source": "Object.defineProperty(navigator, 'webdriver',{get:()=>undefined});"
+})
+
+one_year_ago = datetime.now() - timedelta(days=365)
+results = []
+
+try:
+    for _, row in df_links.iterrows():
+        playa_no = row['NO']
+        url = row['Link']
+        if not isinstance(url, str) or not url.startswith('http'):
+            continue
+
+        try:
+            driver.get(url)
+            human_delay(2, 5)
+
+            # 1) Click en Opiniones
+            wait.until(EC.element_to_be_clickable((By.XPATH,
+                "//button[.//div[text()='Opiniones']]"
+            ))).click()
+            human_delay(1,2)
+
+            # 2) Ordenar → Más recientes
+            try:
+                wait.until(EC.element_to_be_clickable((By.XPATH,
+                    "//span[contains(text(),'Ordenar')]"
+                ))).click()
+                human_delay(1,1)
+                wait.until(EC.element_to_be_clickable((By.XPATH,
+                    "//div[@role='menuitemradio' and .//div[text()='Más recientes']]"
+                ))).click()
+                human_delay(1,1)
+            except:
+                pass
+
+            # 3) Panel de reseñas
+            panel = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
+                "div.m6QErb.DxyBCb.kA9KIf.dS8AEf.XiKgde"
+            )))
+
+            processed = set()
+            stop_link = False
+
+            # 4) Extracción + scroll fino
+            while True:
+                cards = driver.find_elements(By.CSS_SELECTOR, "div[data-review-id]")
+                for card in cards:
+                    rid = card.get_attribute("data-review-id")
+                    if rid in processed:
+                        continue
+
+                    # expandir "Más" si aparece
+                    try:
+                        btn = card.find_element(By.CSS_SELECTOR,
+                            "button.w8nwRe.kyuRq[aria-expanded='false']")
+                        human_delay(0.3,0.7)
+                        btn.click()
+                    except:
+                        pass
+
+                    # leer fecha cruda
+                    raw_date = ""
+                    try:
+                        raw_date = card.find_element(By.CSS_SELECTOR, "span.rsqaWe").text
+                    except:
+                        pass
+
+                    # si es "Hace 1/2/3 años", guardar y parar link, puedes delimitar 
+                    if re.search(r'hace\s+(un|una|1)\s+año', raw_date.lower()) \
+                    or re.search(r'hace\s+2\s+años', raw_date.lower()) \
+                    or re.search(r'hace\s+3\s+años', raw_date.lower()):
+                        date_obj = parse_relative_time_es(raw_date)
+                        # extraer estrellas
+                        try:
+                            stars = int(card.find_element(By.CSS_SELECTOR, "span.kvMYJc")
+                                            .get_attribute("aria-label").split()[0])
+                        except:
+                            stars = None
+                        # extraer texto
+                        parts = [t.text.strip() for t in card.find_elements(By.CSS_SELECTOR, "span.wiI7pd")]
+                        text = " ".join(parts)
+                        results.append({
+                            'playa_no': playa_no,
+                            'link': url,
+                            'id': rid,
+                            'date': date_obj.date().isoformat() if date_obj else raw_date,
+                            'stars': stars,
+                            'text': text
+                        })
+                        processed.add(rid)
+                        stop_link = True
+                        break
+
+                    # parsear fecha normal
+                    date_obj = parse_relative_time_es(raw_date)
+                    if date_obj and date_obj < one_year_ago:
+                        processed.add(rid)
+                        continue
+
+                    # extraer estrellas y texto
+                    try:
+                        stars = int(card.find_element(By.CSS_SELECTOR, "span.kvMYJc")
+                                        .get_attribute("aria-label").split()[0])
+                    except:
+                        stars = None
+                    parts = [t.text.strip() for t in card.find_elements(By.CSS_SELECTOR, "span.wiI7pd")]
+                    text = " ".join(parts)
+
+                    results.append({
+                        'playa_no': playa_no,
+                        'link': url,
+                        'id': rid,
+                        'date': date_obj.date().isoformat() if date_obj else raw_date,
+                        'stars': stars,
+                        'text': text
+                    })
+                    processed.add(rid)
+                    human_delay(0.2,0.5)
+
+                if stop_link:
+                    break
+
+                # scroll fino + espera activa
+                prev = len(processed)
+                driver.execute_script("arguments[0].scrollBy(0, 250);", panel)
+                human_delay(1,2)
+                start = time.time()
+                while time.time() - start < 5:
+                    time.sleep(0.5)
+                    if len(driver.find_elements(By.CSS_SELECTOR, "div[data-review-id]")) > prev:
+                        break
+                else:
+                    break  # no cargó más
+
+        except Exception as e:
+            print(f"Error en link {url}: {e}. Continuando con el siguiente.")
+
+    # fin for links
+
+finally:
+    driver.quit()
+    df = pd.DataFrame(results).drop_duplicates(subset=['id'])
+    df.to_csv('reviews_allsplayas.csv', index=False, encoding='utf-8-sig')
+    print(f"Se guardaron {len(df)} reseñas en 'reviews_allsplayas.csv'.")
